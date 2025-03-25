@@ -1,28 +1,33 @@
-;; Crypto Mining Rewards Platform - Enhanced Version
-;; Advanced implementation with miner tracking and comprehensive rewards
+;; Crypto Mining Rewards Platform
+;; A blockchain-based mining rewards system with progressive challenges and incentives
 
+;; Constants
 (define-constant ERR-NOT-AUTHORIZED (err u1))
 (define-constant ERR-PLATFORM-NOT-ACTIVE (err u2))
 (define-constant ERR-INVALID-CHALLENGE (err u3))
-(define-constant ERR-WRONG-SOLUTION (err u4))
-(define-constant ERR-ALREADY-SOLVED (err u5))
-(define-constant ERR-INSUFFICIENT-STAKE (err u6))
+(define-constant ERR-ALREADY-COMPLETED (err u4))
+(define-constant ERR-WRONG-SOLUTION (err u5))
+(define-constant ERR-TIME-LOCKED (err u6))
+(define-constant ERR-INSUFFICIENT-STAKE (err u7))
+(define-constant ERR-INVALID-INPUT (err u8))
 
-;; Platform State
+;; Data Variables
 (define-data-var platform-admin principal tx-sender)
 (define-data-var platform-active bool false)
+(define-data-var current-challenge uint u0)
+(define-data-var mining-entry-stake uint u1000000) ;; 1 STX
 (define-data-var total-reward-pool uint u0)
-(define-data-var mining-entry-fee uint u1000000) ;; 1 STX entry fee
+(define-data-var max-mining-reward uint u1000000000) ;; Reasonable max reward
 
 ;; Mining Challenge Structure
 (define-map mining-challenges
     uint
     {
-        difficulty-description: (string-utf8 256),
-        solution-hash: (buff 32),
-        reward-amount: uint,
-        is-solved: bool,
-        solver: (optional principal)
+        difficulty-clue: (string-utf8 256),
+        hash-target: (buff 32), ;; SHA256 hash of the mining solution
+        unlock-block-height: uint,
+        mining-reward: uint,
+        challenge-completed: bool
     }
 )
 
@@ -30,109 +35,182 @@
 (define-map miner-progress
     principal
     {
-        total-challenges-completed: uint,
-        total-rewards-earned: uint,
-        challenge-history: (list 20 uint)
+        current-challenge-level: uint,
+        completed-challenges: (list 20 uint),
+        last-mining-attempt: uint,
+        total-challenges-solved: uint
     }
 )
 
-;; Authorization Check
+;; Miner Solutions History
+(define-map challenge-solutions
+    {challenge: uint, miner: principal}
+    {
+        attempt-count: uint,
+        solved-block: (optional uint)
+    }
+)
+
+;; Top Miners
+(define-map challenge-top-miners
+    uint
+    (list 10 {miner: principal, solved-at-block: uint})
+)
+
+;; Input Validation Functions
 (define-private (is-platform-admin)
     (is-eq tx-sender (var-get platform-admin)))
 
-;; Platform Initialization
-(define-public (initialize-platform)
+(define-private (is-valid-challenge-id (challenge-id uint))
+    (and (> challenge-id u0) (<= challenge-id u100)))
+
+(define-private (is-valid-difficulty-description (description (string-utf8 256)))
+    (and 
+        (> (len description) u0) 
+        (<= (len description) u256)))
+
+(define-private (is-valid-hash-target (hash (buff 32)))
+    (and 
+        (is-eq (len hash) u32)
+        (not (is-eq hash 0x00))))
+
+(define-private (is-valid-block-height (height uint))
+    (> height block-height))
+
+(define-private (is-valid-mining-reward (reward uint))
+    (and 
+        (> reward u0) 
+        (<= reward (var-get max-mining-reward))))
+
+;; Platform Management Functions
+(define-public (initialize-mining-platform)
     (begin
         (asserts! (is-platform-admin) ERR-NOT-AUTHORIZED)
         (var-set platform-active true)
+        (var-set current-challenge u0)
         (var-set total-reward-pool u0)
+        (ok true)))
+
+(define-public (add-mining-challenge
+    (challenge-id uint)
+    (difficulty-description (string-utf8 256))
+    (hash-target (buff 32))
+    (unlock-block-height uint)
+    (mining-reward uint))
+    (begin
+        ;; Input validation checks
+        (asserts! (is-platform-admin) ERR-NOT-AUTHORIZED)
+        (asserts! (is-valid-challenge-id challenge-id) ERR-INVALID-INPUT)
+        (asserts! (is-valid-difficulty-description difficulty-description) ERR-INVALID-INPUT)
+        (asserts! (is-valid-hash-target hash-target) ERR-INVALID-INPUT)
+        (asserts! (is-valid-block-height unlock-block-height) ERR-INVALID-INPUT)
+        (asserts! (is-valid-mining-reward mining-reward) ERR-INVALID-INPUT)
+        
+        ;; Existing logic with validated inputs
+        (map-set mining-challenges challenge-id
+            {
+                difficulty-clue: difficulty-description,
+                hash-target: hash-target,
+                unlock-block-height: unlock-block-height,
+                mining-reward: mining-reward,
+                challenge-completed: false
+            })
+        
+        ;; Safe addition with overflow check
+        (let ((new-total (+ (var-get total-reward-pool) mining-reward)))
+            (asserts! (>= new-total (var-get total-reward-pool)) ERR-INVALID-INPUT)
+            (var-set total-reward-pool new-total))
+        
         (ok true)))
 
 ;; Miner Registration
 (define-public (register-miner)
     (begin
         (asserts! (var-get platform-active) ERR-PLATFORM-NOT-ACTIVE)
+        ;; Require entry stake
+        (try! (stx-transfer? (var-get mining-entry-stake) tx-sender (var-get platform-admin)))
         
-        ;; Collect entry fee
-        (try! (stx-transfer? (var-get mining-entry-fee) tx-sender (var-get platform-admin)))
-        
-        ;; Initialize miner progress
-        (map-set miner-progress tx-sender {
-            total-challenges-completed: u0,
-            total-rewards-earned: u0,
-            challenge-history: (list)
-        })
-        
+        (map-set miner-progress tx-sender
+            {
+                current-challenge-level: u0,
+                completed-challenges: (list),
+                last-mining-attempt: u0,
+                total-challenges-solved: u0
+            })
         (ok true)))
 
-;; Create Mining Challenge
-(define-public (create-challenge
+;; Mining Challenge Submission
+(define-public (submit-mining-solution
     (challenge-id uint)
-    (difficulty (string-utf8 256))
-    (solution-hash (buff 32))
-    (reward uint))
-    (begin
-        (asserts! (is-platform-admin) ERR-NOT-AUTHORIZED)
-        (asserts! (var-get platform-active) ERR-PLATFORM-NOT-ACTIVE)
-        
-        (map-set mining-challenges challenge-id {
-            difficulty-description: difficulty,
-            solution-hash: solution-hash,
-            reward-amount: reward,
-            is-solved: false,
-            solver: none
-        })
-        
-        (var-set total-reward-pool (+ (var-get total-reward-pool) reward))
-        (ok true)))
-
-;; Submit Mining Solution
-(define-public (submit-solution
-    (challenge-id uint)
-    (submitted-solution (buff 32)))
+    (mining-solution (buff 32)))
     (let (
         (challenge (unwrap! (map-get? mining-challenges challenge-id) ERR-INVALID-CHALLENGE))
-        (miner-progress (unwrap! (map-get? miner-progress tx-sender) ERR-INSUFFICIENT-STAKE))
+        (miner (unwrap! (map-get? miner-progress tx-sender) ERR-INVALID-CHALLENGE))
         )
+        ;; Check platform availability
         (asserts! (var-get platform-active) ERR-PLATFORM-NOT-ACTIVE)
-        (asserts! (not (get is-solved challenge)) ERR-ALREADY-SOLVED)
+        (asserts! (>= block-height (get unlock-block-height challenge)) ERR-TIME-LOCKED)
+        (asserts! (not (get challenge-completed challenge)) ERR-ALREADY-COMPLETED)
         
-        (if (is-eq submitted-solution (get solution-hash challenge))
+        ;; Verify mining solution - directly compare the hashes
+        (if (is-eq mining-solution (get hash-target challenge))
             (begin
-                ;; Mark challenge as solved
-                (map-set mining-challenges challenge-id 
-                    (merge challenge {
-                        is-solved: true, 
-                        solver: (some tx-sender)
-                    }))
+                ;; Update challenge status
+                (map-set mining-challenges challenge-id
+                    (merge challenge {challenge-completed: true}))
                 
                 ;; Update miner progress
-                (map-set miner-progress tx-sender 
-                    (merge miner-progress {
-                        total-challenges-completed: (+ (get total-challenges-completed miner-progress) u1),
-                        total-rewards-earned: (+ (get total-rewards-earned miner-progress) (get reward-amount challenge)),
-                        challenge-history: (unwrap! 
-                            (as-max-len? (append (get challenge-history miner-progress) challenge-id) u20) 
-                            ERR-INVALID-CHALLENGE)
+                (map-set miner-progress tx-sender
+                    (merge miner {
+                        current-challenge-level: (+ challenge-id u1),
+                        completed-challenges: (unwrap! (as-max-len? 
+                            (append (get completed-challenges miner) challenge-id) u20)
+                            ERR-INVALID-CHALLENGE),
+                        total-challenges-solved: (+ (get total-challenges-solved miner) u1)
                     }))
                 
-                ;; Transfer reward
-                (try! (stx-transfer? (get reward-amount challenge) (var-get platform-admin) tx-sender))
+                ;; Record solution
+                (map-set challenge-solutions
+                    {challenge: challenge-id, miner: tx-sender}
+                    {
+                        attempt-count: u1,
+                        solved-block: (some block-height)
+                    })
                 
-                (ok true)
-            )
+                ;; Award mining reward
+                (try! (stx-transfer? (get mining-reward challenge) (var-get platform-admin) tx-sender))
+                
+                ;; Record top miners
+                (match (map-get? challenge-top-miners challenge-id)
+                    top-miners (map-set challenge-top-miners challenge-id
+                        (unwrap! (as-max-len?
+                            (append top-miners {miner: tx-sender, solved-at-block: block-height})
+                            u10)
+                            ERR-INVALID-CHALLENGE))
+                    (map-set challenge-top-miners challenge-id
+                        (list {miner: tx-sender, solved-at-block: block-height})))
+                
+                (ok true))
             ERR-WRONG-SOLUTION)))
 
-;; Read-only Functions
-(define-read-only (get-challenge-details (challenge-id uint))
-    (map-get? mining-challenges challenge-id))
+;; Read-only functions
+(define-read-only (get-current-mining-difficulty (challenge-id uint))
+    (match (map-get? mining-challenges challenge-id)
+        challenge (if (>= block-height (get unlock-block-height challenge))
+            (ok (get difficulty-clue challenge))
+            ERR-TIME-LOCKED)
+        ERR-INVALID-CHALLENGE))
 
-(define-read-only (get-miner-progress (miner principal))
+(define-read-only (get-miner-status (miner principal))
     (map-get? miner-progress miner))
 
-(define-read-only (get-platform-status)
+(define-read-only (get-challenge-top-miners (challenge-id uint))
+    (map-get? challenge-top-miners challenge-id))
+
+(define-read-only (get-platform-stats)
     {
         active: (var-get platform-active),
+        current-challenge: (var-get current-challenge),
         total-reward-pool: (var-get total-reward-pool),
-        mining-entry-fee: (var-get mining-entry-fee)
+        mining-entry-stake: (var-get mining-entry-stake)
     })
